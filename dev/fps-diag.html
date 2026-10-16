@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>phigrOS 帧率诊断</title>
+<style>
+  body { margin:0; background:#05070f; color:#e9f0ff; font-family:Consolas,"Microsoft YaHei",monospace; }
+  header { padding:10px 14px; border-bottom:1px solid rgba(140,170,255,.2); display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; }
+  #verdict { font-size:14px; font-weight:700; padding:3px 10px; border-radius:999px; background:#243; }
+  #verdict.bad { background:#611; }
+  #verdict.good { background:#162; }
+  #stats { padding:10px 14px; font-size:13px; line-height:1.9; white-space:pre; }
+  .k { color:#7fd7ff; display:inline-block; min-width:220px; }
+  #bar { height:6px; background:#123; margin:8px 14px; border-radius:3px; overflow:hidden; }
+  #bar > i { display:block; height:100%; width:0; background:#3ddc84; }
+  iframe { width:100%; height:calc(100vh - 330px); min-height:360px; border:1px solid rgba(140,170,255,.2); border-radius:8px; margin:0 14px 14px; }
+  #raw { padding:0 14px 14px; font-size:12px; color:#9fb0d0; white-space:pre-wrap; }
+  button { font:inherit; font-size:12px; padding:5px 10px; border-radius:7px; border:1px solid rgba(140,170,255,.3); background:rgba(255,255,255,.07); color:#e9f0ff; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>phigrOS 帧率诊断</h1>
+  <span id="verdict">测量中…</span>
+  <button id="again">重新测量</button>
+  <span id="note" style="font-size:12px;color:#9fb0d0"></span>
+</header>
+<div id="bar"><i id="barfill"></i></div>
+<div id="stats"></div>
+<iframe id="frame" title="phigrOS game under test"></iframe>
+<div id="raw"></div>
+
+<script type="module">
+const frame = document.getElementById('frame');
+const statsEl = document.getElementById('stats');
+const verdictEl = document.getElementById('verdict');
+const rawEl = document.getElementById('raw');
+const barFill = document.getElementById('barfill');
+const note = document.getElementById('note');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const iframeErrors = [];
+window.addEventListener('error', (e) => iframeErrors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => iframeErrors.push(String((e.reason && e.reason.message) || e.reason)));
+
+async function post(payload) {
+  try {
+    await fetch('/__report', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload, null, 2)
+    });
+    note.textContent = '（已回传诊断结果）';
+  } catch (err) {
+    note.textContent = '（回传失败：' + err.message + '）';
+  }
+}
+
+function med(arr) {
+  if (!arr.length) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+function pct(arr, p) {
+  if (!arr.length) return 0;
+  const s = arr.slice().sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(s.length * p))];
+}
+
+/** 原生 rAF 采样：只看浏览器到底给了多少帧 */
+function sampleRaf(win, durationMs) {
+  return new Promise((resolve) => {
+    const gaps = [];
+    let last = win.performance.now();
+    const t0 = last;
+    const step = () => {
+      const now = win.performance.now();
+      gaps.push(now - last);
+      last = now;
+      if (now - t0 < durationMs) win.requestAnimationFrame(step);
+      else resolve(gaps);
+    };
+    win.requestAnimationFrame(step);
+  });
+}
+
+async function measure() {
+  verdictEl.textContent = '测量中…';
+  verdictEl.className = '';
+  statsEl.textContent = '';
+  rawEl.textContent = '';
+  note.textContent = '先点一下 iframe 让它获得焦点';
+
+  // 0) GPU / 渲染能力检测：软件渲染是「一帧一屏」的典型原因
+  const gpu = (() => {
+    const out = { webgl: false, webgl2: false, renderer: null, vendor: null, swiftShader: false, webgpu: false };
+    try {
+      const c = document.createElement('canvas');
+      const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if (gl) {
+        out.webgl = true;
+        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          out.renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+          out.vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+        } else {
+          out.renderer = gl.getParameter(gl.RENDERER);
+          out.vendor = gl.getParameter(gl.VENDOR);
+        }
+        out.swiftShader = /swiftshader|software|basic render|llvmpipe|microsoft basic/i.test(String(out.renderer));
+      }
+      out.webgl2 = Boolean(c.getContext('webgl2'));
+    } catch (err) {
+      out.error = err.message;
+    }
+    out.webgpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
+    out.hardwareConcurrency = navigator.hardwareConcurrency || null;
+    out.deviceMemory = navigator.deviceMemory || null;
+    return out;
+  })();
+
+  // GPU 填充率小基准：256 个大圆 + 阴影，100 次
+  const gpuBench = (() => {
+    try {
+      const c = document.createElement('canvas');
+      c.width = 800; c.height = 600;
+      const ctx = c.getContext('2d');
+      const t0 = performance.now();
+      for (let i = 0; i < 100; i++) {
+        ctx.clearRect(0, 0, 800, 600);
+        ctx.fillStyle = 'rgba(34,211,238,0.5)';
+        for (let k = 0; k < 256; k++) {
+          ctx.beginPath();
+          ctx.arc((k * 37) % 800, (k * 53) % 600, 24, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      return Number((performance.now() - t0).toFixed(1));
+    } catch (err) {
+      return null;
+    }
+  })();
+
+  // 1) 清存档并加载游戏
+  try { localStorage.clear(); } catch {}
+  frame.src = `../index.html?diag=${Date.now()}`;
+  await sleep(400);
+
+  const w = frame.contentWindow;
+  let ready = null;
+  for (let i = 0; i < 100 && !ready; i++) {
+    await sleep(150);
+    if (w.PhigrOS && w.PhigrOS.bootMs) ready = w.PhigrOS;
+  }
+  if (!ready) {
+    verdictEl.textContent = '开机失败';
+    verdictEl.className = 'bad';
+    const w2 = frame.contentWindow;
+    const detail = {
+      kind: 'fps-diagnostic',
+      at: new Date().toISOString(),
+      verdict: '开机失败：iframe 里 phigrOS 没有完成开机',
+      iframeErrors,
+      hasPhigrOS: Boolean(w2 && w2.PhigrOS),
+      hasHost: Boolean(w2 && w2.Host),
+      bootMs: w2 && w2.PhigrOS ? w2.PhigrOS.bootMs : null
+    };
+    statsEl.textContent = JSON.stringify(detail, null, 2);
+    await post(detail);
+    return;
+  }
+
+  // 2) 空载 rAF（没有任何游戏在跑）
+  const idle = await sampleRaf(w, 1500);
+  const idleFps = idle.length ? 1000 / med(idle) : 0;
+
+  // 3) 启动音游并进入游玩
+  const H = w.Host;
+  H.launch('phigros');
+  await sleep(1200);
+  const d = w.document;
+  const card = await (async () => {
+    for (let i = 0; i < 60; i++) {
+      const c = d.querySelector('.win[data-app-id="phigros"] [data-track]');
+      if (c) return c;
+      await sleep(150);
+    }
+    return null;
+  })();
+  if (!card) {
+    verdictEl.textContent = '音游界面未出现';
+    verdictEl.className = 'bad';
+    return;
+  }
+  card.click();
+  await sleep(600);
+  const start = [...d.querySelectorAll('.win[data-app-id="phigros"] button')].find((b) => /开始|游玩|START|Play/i.test(b.textContent));
+  if (start) {
+    try { start.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true })); } catch {}
+    start.click();
+  }
+  for (let i = 0; i < 80; i++) {
+    if (d.querySelector('.win[data-app-id="phigros"] canvas')) break;
+    await sleep(150);
+  }
+  await sleep(4200); // 等倒计时
+
+  // 4) 游玩中测量：同时跟踪「墙钟时间」与「游戏时间」的比值
+  const canvas = d.querySelector('.win[data-app-id="phigros"] canvas');
+  const measureMs = 4000;
+  const game = w.__PHIGROS_GAME__;
+  const wallT0 = w.performance.now();
+  const tStart = game ? game.time : null;
+  const headStart = game && game.handle ? game.handle.offset : null;
+  const rafGaps = await sampleRaf(w, measureMs);
+  const wallT1 = w.performance.now();
+  const tEnd = game ? game.time : null;
+  const wallSec = (wallT1 - wallT0) / 1000;
+  const gameSec = tStart !== null && tEnd !== null ? tEnd - tStart : null;
+
+  // 5) 收集
+  const tele = w.__PHIGROS_TELEMETRY__ || null;
+  const esc = w.__PHIGROS_LOOP_ESCALATED__ || null;
+  const gameFps = game ? game.fps : null;
+  const rafFps = rafGaps.length ? 1000 / med(rafGaps) : 0;
+  const fallRate = gameSec !== null ? gameSec / wallSec : null;
+  const clockInfo = game
+    ? {
+        degraded: game.degraded,
+        clockSource: game.degraded ? 'fallback(performance.now)' : 'audio',
+        handleUnsupported: !!(game.handle && game.handle.unsupported),
+        fbOffset: game._fbOffset,
+        fbStartSet: game._fbStart !== null,
+        audioZeroFrames: game._audioZeroFrames,
+        state: game.state,
+        paused: game.paused
+      }
+    : null;
+
+  const lines = [
+    ['GPU 渲染器', gpu.renderer || '(拿不到)'],
+    ['GPU 厂商', gpu.vendor || '(拿不到)'],
+    ['是否软件渲染（SwiftShader/Basic）', gpu.swiftShader ? '是 —— 这就是一帧一屏的根因' : '否'],
+    ['WebGL / WebGL2 / WebGPU', `${gpu.webgl} / ${gpu.webgl2} / ${gpu.webgpu}`],
+    ['Canvas 填充基准（256圆×100）', gpuBench === null ? '失败' : `${gpuBench} ms（<400 正常，>1500 为软件渲染）`],
+    ['CPU 核心数 / 内存', `${gpu.hardwareConcurrency || '?'} / ${gpu.deviceMemory || '?'}GB`],
+    ['iframe 加载后空载 rAF 帧率', `${idleFps.toFixed(1)} fps（中位帧间隔 ${med(idle).toFixed(1)}ms，采样 ${idle.length} 帧）`],
+    ['游玩中 rAF 帧率（合成器视角）', `${rafFps.toFixed(1)} fps（中位 ${med(rafGaps).toFixed(1)}ms，p95 ${pct(rafGaps, 0.95).toFixed(1)}ms，最长 ${(rafGaps.length ? Math.max(...rafGaps) : 0).toFixed(0)}ms）`],
+    ['引擎自报帧率 game.fps', String(gameFps)],
+    ['引擎实际推进倍率', fallRate === null ? '无句柄' : `${fallRate.toFixed(2)}× 实时（应 ≈1.00）`],
+    ['墙钟 ${measureMs}ms 内游戏推进', gameSec === null ? '无句柄' : `${gameSec.toFixed(2)}s / ${wallSec.toFixed(2)}s`],
+    ['时钟来源', clockInfo ? `${clockInfo.clockSource}（degraded=${clockInfo.degraded}，handleUnsupported=${clockInfo.handleUnsupported}，fbOffset=${clockInfo.fbOffset}，state=${clockInfo.state}）` : '无句柄'],
+    ['是否换用定时器驱动', esc ? `是（${JSON.stringify(esc)}）` : '否（仍为 rAF）'],
+    ['活跃 rAF 循环数（应 ≤ 2）', (() => {
+      try {
+        const n = H.rafLoopCount ? H.rafLoopCount() : null;
+        if (n === null) return '宿主未暴露计数';
+        // 正常构成：合成器 1 条（FPS 计）+ 音游 1 条 = 2；数值随时间增长即泄漏
+        return n <= 2 ? `${n}（正常）` : `${n} —— 帧循环泄漏！这会导致时钟加速与页面卡死`;
+      } catch (err) { return '读取失败'; }
+    })()],
+    ['document.visibilityState', d.visibilityState],
+    ['document.hasFocus()', String(d.hasFocus ? d.hasFocus() : 'n/a')],
+    ['devicePixelRatio', String(w.devicePixelRatio)],
+    ['canvas 尺寸', canvas ? `${canvas.width}×${canvas.height}（CSS ${canvas.clientWidth}×${canvas.clientHeight}）` : '无']
+  ];
+  if (tele) {
+    lines.push([
+      '引擎遥测',
+      `平均帧 ${tele.avgFrameMs}ms / 最长帧 ${tele.maxFrameMs}ms / 单帧工作 ${tele.avgWorkMs}ms / 帧内总计 ${tele.avgFrameTotalMs}ms / 帧间空档 平均 ${tele.avgIdleGapMs}ms 最长 ${tele.maxIdleGapMs}ms / >200ms 停顿 ${tele.stallsOver200ms} 次 / 驱动=${tele.loop} / 后端=${tele.renderMode} / fps=${tele.fps}`
+    ]);
+    if (tele.longTasks && tele.longTasks.length) {
+      const top = tele.longTasks.slice().sort((a, b) => b.dur - a.dur).slice(0, 5);
+      lines.push(['长任务（>50ms，最重的 5 个）', top.map((t) => `${t.dur}ms@${t.start}`).join(', ')]);
+    } else {
+      lines.push(['长任务（>50ms）', '无（说明主线程没有被单个同步任务长时间占用）']);
+    }
+  } else {
+    lines.push(['引擎遥测', '未产生（说明引擎的帧回调几乎没被调用）']);
+  }
+  statsEl.textContent = lines.map(([k, v]) => `${k.padEnd(34, ' ')} : ${v}`).join('\n');
+
+  // 6) 判定结论
+  let verdict;
+  let cls;
+  if (gpu.swiftShader || (gpuBench !== null && gpuBench > 1500)) {
+    verdict = `判定：你的浏览器正在用软件渲染（${gpu.renderer || '未知'}），没有 GPU 加速 —— 这是「一帧一屏」的根因，与代码无关`;
+    cls = 'bad';
+  } else if (fallRate !== null && (fallRate > 1.25 || fallRate < 0.8)) {
+    verdict = `判定：游戏时钟跑飞（${fallRate.toFixed(2)}× 实时）——音符会跳格，这是时钟 bug 不是渲染问题`;
+  } else if (rafFps < 12 && idleFps > 30) {
+    verdict = `判定：游玩中 rAF 被节流（空载 ${idleFps.toFixed(0)}fps → 游玩 ${rafFps.toFixed(0)}fps）`;
+  } else if (rafFps < 12 && idleFps < 12) {
+    verdict = `判定：整个 iframe 的 rAF 都被节流到 ${rafFps.toFixed(0)}fps（环境限制）`;
+  } else if (rafFps >= 45 && fallRate !== null && Math.abs(fallRate - 1) <= 0.25) {
+    verdict = `判定：一切正常（${rafFps.toFixed(0)}fps，推进 ${fallRate.toFixed(2)}×），画面应连续下落`;
+  } else {
+    verdict = '判定：数据异常，见上表';
+  }
+  if (rafFps >= 45 && fallRate !== null && Math.abs(fallRate - 1) <= 0.25) cls = 'good';
+  else cls = 'bad';
+  verdictEl.textContent = verdict;
+  verdictEl.className = cls;
+
+  rawEl.textContent = JSON.stringify({
+    idleFps: Number(idleFps.toFixed(1)),
+    rafFps: Number(rafFps.toFixed(1)),
+    rafMedian: Number(med(rafGaps).toFixed(1)),
+    rafP95: Number(pct(rafGaps, 0.95).toFixed(1)),
+    rafSamples: rafGaps.length,
+    gameFps,
+    fallRate: fallRate === null ? null : Number(fallRate.toFixed(3)),
+    gameSec: gameSec === null ? null : Number(gameSec.toFixed(3)),
+    wallSec: Number(wallSec.toFixed(3)),
+    clockInfo,
+    escalated: esc,
+    telemetry: tele,
+    visibility: d.visibilityState,
+    canvas: canvas ? { w: canvas.width, h: canvas.height } : null,
+    dpr: w.devicePixelRatio
+  }, null, 2);
+
+  try {
+    await post({ kind: 'fps-diagnostic', at: new Date().toISOString(), verdict, lines, raw: rawEl.textContent, iframeErrors });
+    note.textContent = '（已回传诊断结果）';
+  } catch (err) {
+    note.textContent = '（回传失败：' + err.message + '）';
+  }
+}
+
+document.getElementById('again').addEventListener('click', () => measure().catch((e) => {
+  verdictEl.textContent = '诊断脚本异常：' + e.message;
+  verdictEl.className = 'bad';
+}));
+
+let p = 0;
+setInterval(() => { p = (p + 3) % 100; barFill.style.width = p + '%'; }, 200);
+measure().catch((e) => {
+  verdictEl.textContent = '诊断脚本异常：' + e.message;
+  verdictEl.className = 'bad';
+});
+</script>
+</body>
+</html>

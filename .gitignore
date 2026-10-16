@@ -1,0 +1,21 @@
+# 依赖（本项目零依赖，这里只是防御性忽略）
+node_modules/
+package-lock.json
+
+# 开发期产物 / 浏览器临时 profile（体积大且无意义）
+dev/shots/
+dev/shots-*/
+dev/*.profile-*/
+dev/last-report.json
+
+# 编辑器 / 操作系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 日志
+*.log
+npm-debug.log*

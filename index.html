@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#05070f" />
+<title>phigrOS · An OS tuned for rhythm games</title>
+<link rel="stylesheet" href="./styles/shell.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎵</text></svg>" />
+</head>
+<body>
+
+<!-- ================= 开机自检 ================= -->
+<div id="boot">
+  <div class="boot-inner">
+    <div class="boot-logo">
+      <span class="boot-mark">phigr</span><span class="boot-mark alt">OS</span>
+    </div>
+    <div class="boot-tagline">An OS tuned for rhythm games</div>
+    <div id="boot-log" class="boot-log"></div>
+    <div class="boot-bar"><i id="boot-bar-fill"></i></div>
+    <div class="boot-hint">phigrOS BIOS v1.0.0 · 正在启动</div>
+  </div>
+</div>
+
+<!-- ================= 桌面 ================= -->
+<div id="desktop" aria-label="phigrOS 桌面">
+  <div id="wallpaper" class="wallpaper wp-aurora"></div>
+  <div id="scanlines" aria-hidden="true"></div>
+  <div id="windows"></div>
+</div>
+
+<!-- ================= 会话层 ================= -->
+<div id="start-menu" class="start-menu" aria-label="开始菜单"></div>
+<div id="taskbar" class="taskbar"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="modals"></div>
+
+<noscript>
+  <div class="noscript">phigrOS 需要启用 JavaScript 才能启动。</div>
+</noscript>
+
+<script type="module" src="./boot.js"></script>
+</body>
+</html>

@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>phigrOS 验收台 · Acceptance Harness</title>
+<style>
+  :root { --ok:#3ddc84; --err:#ff5d6c; --warn:#ffb347; --fg:#e9f0ff; --dim:#9fb0d0; --line:rgba(140,170,255,.2); }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#05070f; color:var(--fg); font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+  header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; letter-spacing:.04em; }
+  .meta { font-size:12px; color:var(--dim); }
+  .badge { padding:2px 9px; border-radius:999px; font-size:11.5px; border:1px solid var(--line); }
+  .badge.run { color:var(--warn); }
+  .badge.pass { color:var(--ok); border-color:color-mix(in srgb,var(--ok) 45%,transparent); }
+  .badge.fail { color:var(--err); border-color:color-mix(in srgb,var(--err) 45%,transparent); }
+  button { font:inherit; font-size:12.5px; padding:6px 12px; border-radius:8px; border:1px solid var(--line);
+           background:rgba(255,255,255,.07); color:var(--fg); cursor:pointer; }
+  button:hover:not(:disabled) { background:rgba(255,255,255,.14); }
+  button:disabled { opacity:.45; cursor:default; }
+  #checklist { display:flex; flex-wrap:wrap; gap:5px; padding:8px 14px; max-height:180px; overflow:auto; border-bottom:1px solid var(--line); }
+  .item { font-size:11.5px; padding:3px 9px; border-radius:999px; border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .item.pass { color:#04180d; background:var(--ok); border-color:transparent; }
+  .item.fail { color:#1a0507; background:var(--err); border-color:transparent; }
+  .item.run { color:#1a1204; background:var(--warn); border-color:transparent; }
+  .item.skip { opacity:.5; }
+  #frame-wrap { padding:8px 14px 14px; }
+  iframe { width:100%; height:calc(100vh - 250px); min-height:420px; border:1px solid var(--line); border-radius:10px; background:#04060d; }
+  #errors { padding:0 14px 10px; font-family:Consolas,monospace; font-size:11.5px; color:var(--err); white-space:pre-wrap; max-height:80px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>phigrOS 验收台</h1>
+  <span class="meta" id="status">准备中…</span>
+  <span class="badge" id="result-badge">待运行</span>
+  <button id="btn-run">重新运行自检</button>
+  <button id="btn-report" disabled>上报结果</button>
+  <span class="meta" id="meta"></span>
+</header>
+<div id="checklist"></div>
+<div id="errors"></div>
+<div id="frame-wrap"><iframe id="frame" title="phigrOS"></iframe></div>
+
+<script type="module">
+const CHECKS = [
+  ['boot', '开机完成'],
+  ['desktop', '桌面就绪（图标/任务栏/时钟）'],
+  ['apps', '应用清单登记（含惰性应用）'],
+  ['fs', 'VFS 初始内容 + 读写/建目录/删除'],
+  ['startmenu', '开始菜单可开合'],
+  ['terminal', '终端启动 + 命令执行'],
+  ['theme', 'theme 命令生效 + 成就解锁'],
+  ['phigros', '音游启动 + 选曲渲染'],
+  ['chart', '至少 3 首曲目'],
+  ['play', '进入游玩（canvas 创建）'],
+  ['keypress', '真实键盘输入被判定命中'],
+  ['result', '结算界面渲染'],
+  ['record', '成绩入档 player.record'],
+  ['achieve', '音游成就解锁'],
+  ['wm', '窗口管理 launch/focus/close'],
+  ['persist', '状态持久化到 localStorage'],
+  ['files', '文件管理器可用'],
+  ['settings', '设置可用（滑杆）'],
+  ['errors', '无 console error / 未捕获异常']
+];
+
+const state = Object.fromEntries(CHECKS.map(([id]) => [id, { status: 'pending', detail: '' }]));
+const checklist = document.getElementById('checklist');
+const statusEl = document.getElementById('status');
+const badgeEl = document.getElementById('result-badge');
+const errorsEl = document.getElementById('errors');
+const metaEl = document.getElementById('meta');
+const frame = document.getElementById('frame');
+const runBtn = document.getElementById('btn-run');
+const reportBtn = document.getElementById('btn-report');
+
+const errors = [];
+const consoleLogs = [];
+let report = null;
+let running = false;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function render() {
+  checklist.innerHTML = '';
+  for (const [id, label] of CHECKS) {
+    const st = state[id];
+    const div = document.createElement('div');
+    div.className = `item ${st.status}`;
+    const mark = { pass: '✓', fail: '✗', run: '…', skip: '⤼', pending: '·' }[st.status];
+    div.textContent = `${mark} ${label}${st.detail ? ` — ${st.detail}` : ''}`;
+    div.title = st.detail || label;
+    checklist.appendChild(div);
+  }
+  const pass = CHECKS.filter(([id]) => state[id].status === 'pass').length;
+  const fail = CHECKS.filter(([id]) => state[id].status === 'fail').length;
+  const done = pass + fail === CHECKS.length;
+  badgeEl.textContent = done && fail === 0 ? `全部通过 ${pass}/${CHECKS.length}` : `${pass} 通过 / ${fail} 失败`;
+  badgeEl.className = `badge ${done && fail === 0 ? 'pass' : fail > 0 ? 'fail' : 'run'}`;
+}
+
+function mark(id, ok, detail = '') {
+  state[id].status = ok ? 'pass' : 'fail';
+  state[id].detail = String(detail).slice(0, 200);
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${id} :: ${state[id].detail}`);
+  render();
+}
+
+function skip(id, why) {
+  state[id].status = 'skip';
+  state[id].detail = String(why).slice(0, 120);
+  console.log(`SKIP ${id} :: ${why}`);
+  render();
+}
+
+function begin(id) {
+  state[id].status = 'run';
+  render();
+}
+
+async function waitFor(fn, timeout = 8000, interval = 150) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try {
+      const v = await fn();
+      if (v) return v;
+    } catch {
+      /* 页面可能正在导航 */
+    }
+    await sleep(interval);
+  }
+  return null;
+}
+
+function pressKey(w, key, type) {
+  const ev = new w.KeyboardEvent(type, { key, code: `Key${key.toUpperCase()}`, bubbles: true, cancelable: true });
+  w.document.dispatchEvent(ev);
+  (w.document.activeElement || w.document).dispatchEvent(ev);
+}
+
+// ============================================================
+//  各步：绝不中断，失败只记录
+// ============================================================
+const ctx = { w: null, H: null, d: null, cards: null, termId: null };
+
+const STEPS = [
+  ['boot', async () => {
+    frame.src = `../index.html?t=${Date.now()}`;
+    await sleep(400);
+    const w = await waitFor(() => (frame.contentWindow && frame.contentWindow.PhigrOS ? frame.contentWindow : null), 10000);
+    if (!w) return mark('boot', false, 'iframe 未加载 index.html');
+    ctx.w = w;
+    const origError = w.console.error.bind(w.console);
+    const origLog = w.console.log.bind(w.console);
+    w.console.error = (...a) => { errors.push(a.map(String).join(' ')); try { origError(...a); } catch {} };
+    w.console.log = (...a) => { consoleLogs.push(a.map(String).join(' ').slice(0, 400)); try { origLog(...a); } catch {} };
+    w.addEventListener('error', (e) => errors.push(`error: ${e.message}`));
+    w.addEventListener('unhandledrejection', (e) => errors.push(`rejection: ${(e.reason && e.reason.message) || e.reason}`));
+
+    const booted = await waitFor(() => w.PhigrOS.bootMs, 25000);
+    const H = w.Host || (w.PhigrOS && w.PhigrOS.host) || (w.PhigrOS && w.PhigrOS.kernel && w.PhigrOS.kernel.host) || null;
+    mark('boot', Boolean(booted) && Boolean(H),
+      booted ? `${w.PhigrOS.bootMs} ms · window.Host=${w.Host ? 'OK' : '缺失!'}` : '25 秒未完成开机');
+    if (!booted || !H) throw new Error(booted ? 'window.Host 未暴露' : '开机未完成');
+    ctx.H = H;
+    ctx.d = w.document;
+    metaEl.textContent = `phigrOS ${w.PhigrOS.version} · 启动 ${w.PhigrOS.bootMs}ms`;
+  }],
+
+  ['desktop', async () => {
+    await sleep(800);
+    const { d } = ctx;
+    const icons = d.querySelectorAll('#desktop-icons .dicon').length;
+    const clock = (d.querySelector('.tb-clock') || {}).textContent || '';
+    mark('desktop',
+      d.getElementById('desktop').classList.contains('desktop-ready') && icons >= 4 && Boolean(d.querySelector('.tb-start')) && /\d{1,2}:\d{2}/.test(clock),
+      `${icons} 图标 · 时钟 ${clock} · 任务栏 ${Boolean(d.querySelector('.tb-start'))}`);
+  }],
+
+  ['apps', async () => {
+    const apps = ctx.H.apps();
+    mark('apps', apps.length >= 5, `${apps.length} 个：${apps.map((a) => `${a.id}${a.loaded ? '' : '(懒)'}`).join(', ')}`);
+  }],
+
+  ['fs', async () => {
+    const { H } = ctx;
+    const before = Object.keys(H.store.get().fs).length;
+    H.fs.write('/home/__verify.txt', 'hello-phigros');
+    const readBack = H.fs.read('/home/__verify.txt');
+    const listed = H.fs.list('/home').some((f) => f.name === '__verify.txt');
+    H.fs.mkdir('/home/__verifydir/deep');
+    const dirOk = H.fs.stat('/home/__verifydir/deep').type === 'dir';
+    H.fs.remove('/home/__verify.txt');
+    H.fs.remove('/home/__verifydir');
+    const cleaned = !H.fs.exists('/home/__verify.txt') && !H.fs.exists('/home/__verifydir');
+    const after = Object.keys(H.store.get().fs).length;
+    const seeded = ['/home/README.txt', '/home/欢迎.md', '/home/Documents', '/system'].every((p) => H.fs.exists(p));
+    mark('fs', readBack === 'hello-phigros' && listed && dirOk && cleaned && seeded,
+      `初始播种=${seeded} ${before}→${after} 节点，读写/嵌套建目录/递归删除=${cleaned}`);
+  }],
+
+  ['startmenu', async () => {
+    const { d } = ctx;
+    d.querySelector('.tb-start').click();
+    await sleep(320);
+    const open = d.getElementById('start-menu').classList.contains('open');
+    const items = d.querySelectorAll('#start-list .start-item').length;
+    d.querySelector('.tb-start').click();
+    await sleep(260);
+    const closed = !d.getElementById('start-menu').classList.contains('open');
+    mark('startmenu', open && closed && items >= 5, `打开=${open} 关闭=${closed} 条目=${items}`);
+  }],
+
+  ['terminal', async () => {
+    const { H, d } = ctx;
+    const before = H.wm.list().length;
+    ctx.termId = H.launch('terminal');
+    const input = await waitFor(() => d.querySelector('.terminal-app .term-input'), 8000);
+    if (!input) return mark('terminal', false, '终端窗口未渲染（.terminal-app .term-input 缺失）');
+    const fire = (v) => {
+      input.value = v;
+      input.dispatchEvent(new ctx.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    };
+    fire('sysinfo');
+    fire('ls /home');
+    fire('cat /home/README.txt');
+    fire('help');
+    await sleep(500);
+    const text = d.querySelector('.terminal-app .term-out').textContent;
+    mark('terminal', H.wm.list().length > before && text.includes('分辨率') && text.includes('README') && text.includes('phigros'),
+      `${text.length} 字符 · 窗口 ${ctx.termId}`);
+    ctx.termInput = input;
+  }],
+
+  ['theme', async () => {
+    const { H, d, w } = ctx;
+    if (!ctx.termInput) return skip('theme', '终端不可用');
+    ctx.termInput.value = 'theme 280';
+    ctx.termInput.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await sleep(450);
+    const hue = H.store.get().settings.themeHue;
+    const accent = d.documentElement.style.getPropertyValue('--accent');
+    const ach = Boolean(H.store.get().achievements['theme-hue']);
+    mark('theme', hue === 280 && Boolean(accent) && ach, `themeHue=${hue} --accent="${accent.trim()}" 成就=${ach}`);
+  }],
+
+  ['phigros', async () => {
+    const { H, d } = ctx;
+    const id = H.launch('phigros');
+    const card = await waitFor(() => d.querySelector('.win[data-app-id="phigros"] [data-track]'), 15000);
+    ctx.cards = d.querySelectorAll('.win[data-app-id="phigros"] [data-track]');
+    mark('phigros', Boolean(card), card ? `窗口 ${id}，卡片已渲染` : '选曲卡片未出现');
+  }],
+
+  ['chart', async () => {
+    const { d } = ctx;
+    const cards = d.querySelectorAll('.win[data-app-id="phigros"] [data-track]');
+    mark('chart', cards.length >= 3, `${cards.length} 首：${[...cards].map((c) => c.dataset.track).join(', ')}`);
+  }],
+
+  ['play', async () => {
+    const { d, w, H } = ctx;
+    const cards = d.querySelectorAll('.win[data-app-id="phigros"] [data-track]');
+    if (!cards.length) return skip('play', '没有曲目卡片');
+    cards[0].click();
+    const startBtn = await waitFor(() => {
+      const btns = [...d.querySelectorAll('.win[data-app-id="phigros"] button')];
+      return btns.find((b) => /开始|游玩|START|Play/i.test(b.textContent)) || null;
+    }, 8000);
+    if (!startBtn) return mark('play', false, '未找到「开始」按钮');
+    // 模拟真实用户手势以解锁 AudioContext
+    try { startBtn.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true })); } catch {}
+    try { d.body.dispatchEvent(new w.PointerEvent('pointerdown', { bubbles: true })); } catch {}
+    const t0 = w.performance.now();
+    startBtn.click();
+    const canvas = await waitFor(() => d.querySelector('.win[data-app-id="phigros"] canvas'), 15000);
+    if (!canvas) return mark('play', false, 'canvas 未创建');
+
+    // 每 500ms 采样一次游戏状态，最多 22 秒
+    const timeline = [];
+    let sawPlay = false;
+    let painted = false;
+    for (let i = 0; i < 44; i++) {
+      await sleep(500);
+      const st = w.__PHIGROS_GAME_STATE__ || {};
+      if (i % 2 === 0) timeline.push(`${((w.performance.now() - t0) / 1000).toFixed(1)}s:${st.phase || '?'}@${typeof st.t === 'number' ? st.t.toFixed(1) : '?'}`);      if (st.phase === 'play') {
+        sawPlay = true;
+        try {
+          const c2 = canvas.getContext('2d');
+          const px = c2.getImageData(0, 0, Math.min(96, canvas.width), Math.min(96, canvas.height)).data;
+          for (let k = 3; k < px.length; k += 4) if (px[k] !== 0) { painted = true; break; }
+        } catch {}
+        if (painted) break;
+      }
+    }
+    const st = w.__PHIGROS_GAME_STATE__ || {};
+    const overlayText = (() => {
+      const ov = d.querySelector('.win[data-app-id="phigros"] div[style*="position:absolute"]');
+      return ov ? ov.textContent.replace(/\s+/g, ' ').slice(0, 80) : '';
+    })();
+    const audioState = (() => {
+      try {
+        const e = H.audio && H.audio.engine;
+        const ctxA = e && e.ctx;
+        return ctxA ? `${ctxA.state}/${ctxA.sampleRate}` : 'no-ctx';
+      } catch { return 'err'; }
+    })();
+    ctx.gameHandle = Boolean(w.__PHIGROS_GAME__);
+    const renderStats = w.__PHIGROS_RENDER_STATS__ || null;
+    const snap = w.__PHIGROS_SNAP__ || null;
+    metaEl.textContent += ` · ${timeline.slice(-8).join(' ')}`;
+    mark('play', sawPlay && painted,
+      `canvas ${canvas.width}×${canvas.height} · phase=${st.phase} t=${st.t} · 描绘=${painted} · 句柄=${ctx.gameHandle} · 快照=${JSON.stringify(snap)} · 渲染=${JSON.stringify(renderStats)} · audio=${audioState} · 轨迹 ${timeline.slice(0, 12).join(' ')}`);
+  }],
+
+  ['keypress', async () => {
+    const { w } = ctx;
+    if (!w.__PHIGROS_GAME__) return skip('keypress', '无调试句柄 __PHIGROS_GAME__');
+    const before = (() => { try { return w.__PHIGROS_GAME__.results(); } catch { return null; } })();
+    // 帧率采样：直接量 iframe 的 requestAnimationFrame 间隔
+    const frameGaps = [];
+    let rafId = 0;
+    let last = w.performance.now();
+    const sample = () => {
+      const now = w.performance.now();
+      frameGaps.push(now - last);
+      last = now;
+      rafId = w.requestAnimationFrame(sample);
+    };
+    rafId = w.requestAnimationFrame(sample);
+
+    const keys = ['d', 'f', 'j', 'k'];
+    let i = 0;
+    const timer = w.setInterval(() => {
+      const k = keys[i++ % 4];
+      pressKey(w, k, 'keydown');
+      setTimeout(() => pressKey(w, k, 'keyup'), 40);
+    }, 105);
+    await sleep(7000);
+    w.clearInterval(timer);
+    w.cancelAnimationFrame(rafId);
+
+    const gaps = frameGaps.slice(5).sort((a, b) => a - b);
+    const avg = gaps.length ? gaps.reduce((s, v) => s + v, 0) / gaps.length : 0;
+    const p95 = gaps.length ? gaps[Math.floor(gaps.length * 0.95)] : 0;
+    const worst = gaps.length ? gaps[gaps.length - 1] : 0;
+    const fps = avg > 0 ? 1000 / avg : 0;
+
+    let counts = null;
+    try { counts = w.__PHIGROS_GAME__.results(); } catch {}
+    const st = w.__PHIGROS_GAME_STATE__ || {};
+    counts = counts || st.counts || {};
+    const hit = (counts.perfect || 0) + (counts.good || 0) + (counts.bad || 0);
+    const gameFps = (() => { try { return w.__PHIGROS_GAME__.fps; } catch { return null; } })();
+    const telemetry = w.__PHIGROS_TELEMETRY__ || null;
+    const escalated = w.__PHIGROS_LOOP_ESCALATED__ || null;
+    ctx.frameStats = {
+      fps: Number(fps.toFixed(1)),
+      avg: Number(avg.toFixed(1)),
+      p95: Number(p95.toFixed(1)),
+      worst: Number(worst.toFixed(1)),
+      frames: gaps.length,
+      gameFps,
+      telemetry,
+      escalated
+    };
+    ctx.counts = counts;
+    ctx.playState = st;
+    metaEl.textContent += ` · 帧率 ${fps.toFixed(1)}fps(引擎自报 ${gameFps}) p95=${p95.toFixed(1)}ms 最长=${worst.toFixed(0)}ms · 判定 ${JSON.stringify(counts)}`;
+    mark('keypress', hit > 0 && fps >= 45,
+      `命中 ${hit} 次 · 帧率 ${fps.toFixed(1)}fps（p95 ${p95.toFixed(1)}ms，最长 ${worst.toFixed(0)}ms，${gaps.length} 帧，引擎自报 ${gameFps}）· counts=${JSON.stringify(counts)}`);
+  }],
+
+  ['result', async () => {
+    const { w, d } = ctx;
+    const g = w.__PHIGROS_GAME__;
+    let mode = 'none';
+    if (g && typeof g.finish === 'function') { g.finish(); mode = 'finish()'; }
+    else if (g && typeof g.seekToEnd === 'function') { g.seekToEnd(); mode = 'seekToEnd()'; }
+    await sleep(3000);
+    const pw = d.querySelector('.win[data-app-id="phigros"]');
+    const text = pw ? pw.textContent : '';
+    // 结算界面应该同时给出分数、准确率与评级
+    const ok = /分数/.test(text) && /(准确|ACC)/i.test(text) && /(评级|S|A|B|C|F)/.test(text);
+    mark('result', ok, `${mode} · ${text.replace(/\s+/g, ' ').slice(0, 150)}`);
+  }],
+
+  ['record', async () => {
+    const { H } = ctx;
+    await sleep(400);
+    const s = H.store.get();
+    const ids = Object.keys(s.player.record || {});
+    const first = ids.length ? Object.values(s.player.record[ids[0]])[0] : null;
+    mark('record', ids.length > 0 && s.player.totalPlay >= 1 && typeof s.player.rks === 'number',
+      `totalPlay=${s.player.totalPlay} rks=${s.player.rks} ${JSON.stringify(first)}`);
+  }],
+
+  ['achieve', async () => {
+    const { H } = ctx;
+    const ids = Object.keys(H.store.get().achievements || {});
+    mark('achieve', ids.length >= 2, ids.join(', '));
+  }],
+
+  ['wm', async () => {
+    const { H } = ctx;
+    const before = H.wm.list();
+    if (before.length < 2) return mark('wm', false, `窗口数不足（${before.length}），无法验证层叠与关闭`);
+    const focusBefore = H.wm.focused();
+    const target = before.find((x) => x.id !== focusBefore) || before[0];
+    H.wm.focus(target.id);
+    await sleep(160);
+    const focusAfter = H.wm.focused();
+    const victim = H.wm.list().filter((x) => x.id !== focusAfter).slice(-1)[0];
+    H.wm.close(victim.id);
+    await sleep(350);
+    const after = H.wm.list();
+    mark('wm', after.length === before.length - 1 && focusAfter === target.id,
+      `${before.length}→${after.length} 窗口，聚焦 ${focusBefore}→${focusAfter}（目标 ${target.id}）`);
+  }],
+
+  ['persist', async () => {
+    await sleep(700);
+    const { d } = ctx;
+    let info = { ok: false };
+    try {
+      const raw = localStorage.getItem('phigros-os:state:v1');
+      if (raw) {
+        const p = JSON.parse(raw);
+        const windowsPersisted = Array.isArray(p.windows) ? p.windows.length : -1;
+        const openWindows = d.querySelectorAll('.win').length;
+        info = {
+          ok: p.version === 1 && p.boot.bootCount >= 1 && windowsPersisted === openWindows,
+          boot: p.boot.bootCount,
+          settingsKeys: Object.keys(p.settings).length,
+          achievements: Object.keys(p.achievements || {}).length,
+          windowsPersisted,
+          openWindows,
+          bytes: raw.length
+        };
+      }
+    } catch (err) { info = { ok: false, err: err.message }; }
+    mark('persist', info.ok, JSON.stringify(info));
+  }],
+
+  ['files', async () => {
+    const { H, d } = ctx;
+    H.launch('files');
+    const el = await waitFor(() => {
+      const n = d.querySelector('.win[data-app-id="files"]');
+      return n && n.textContent.length > 40 ? n : null;
+    }, 9000);
+    mark('files', Boolean(el), el ? el.textContent.replace(/\s+/g, ' ').slice(0, 100) : '未渲染');
+  }],
+
+  ['settings', async () => {
+    const { H, d } = ctx;
+    H.launch('settings');
+    const el = await waitFor(() => {
+      const n = d.querySelector('.win[data-app-id="settings"]');
+      return n && n.querySelectorAll('input[type=range]').length >= 2 ? n : null;
+    }, 9000);
+    const sliders = el ? el.querySelectorAll('input[type=range]').length : 0;
+    mark('settings', Boolean(el), `${sliders} 个滑杆`);
+  }],
+
+  ['errors', async () => {
+    // 给异步错误一点时间冒出来
+    await sleep(500);
+    const real = errors.filter((e) => !/favicon|Autoplay|NotAllowedError|play\(\) failed|not allowed to start|AudioContext/i.test(e));
+    mark('errors', real.length === 0, real.length ? real.slice(0, 4).join(' ;; ') : '无');
+  }]
+];
+function beat(id, note = '') {
+  try {
+    fetch('/__heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ step: id, note, at: new Date().toISOString() })
+    }).catch(() => {});
+  } catch {
+    /* 忽略 */
+  }
+}
+
+// ============================================================
+//  驱动
+// ============================================================
+async function runAll() {
+  if (running) return;
+  running = true;
+  runBtn.disabled = true;
+  reportBtn.disabled = true;
+  beat('start');
+  try { localStorage.clear(); } catch {}
+  errors.length = 0;
+  consoleLogs.length = 0;
+  for (const [id] of CHECKS) state[id] = { status: 'pending', detail: '' };
+  errorsEl.textContent = '';
+  metaEl.textContent = '';
+  render();
+
+  for (const [id, fn] of STEPS) {
+    statusEl.textContent = `正在执行：${id} …`;
+    begin(id);
+    beat('step', id);
+    try {
+      await Promise.race([
+        fn(),
+        sleep(30000).then(() => { throw new Error('单步超过 30 秒'); })
+      ]);
+      if (state[id].status === 'run') mark(id, false, '步骤未给出结论');
+    } catch (err) {
+      mark(id, false, `抛出异常：${(err && err.message) || err}`);
+    }
+  }
+
+  const pass = CHECKS.filter(([id]) => state[id].status === 'pass').length;
+  const fail = CHECKS.filter(([id]) => state[id].status === 'fail').length;
+  const skipped = CHECKS.filter(([id]) => state[id].status === 'skip').length;
+  statusEl.textContent = `完成：${pass} 通过 / ${fail} 失败 / ${skipped} 跳过`;
+  errorsEl.textContent = errors.length ? errors.slice(0, 8).join('\n') : '';
+  report = {
+    finishedAt: new Date().toISOString(),
+    summary: { pass, fail, skipped, total: CHECKS.length },
+    meta: metaEl.textContent,
+    playState: ctx.playState || null,
+    frameStats: ctx.frameStats || null,
+    checks: CHECKS.map(([id, label]) => ({ id, label, ...state[id] })),
+    errors,
+    console: consoleLogs.slice(-120),
+    ua: navigator.userAgent
+  };
+  window.__PHIGROS_ACCEPTANCE__ = report;
+  console.log('SUMMARY ' + JSON.stringify(report.summary));
+  for (const c of report.checks) console.log(`${c.status.toUpperCase()} ${c.label}${c.detail ? ' :: ' + c.detail : ''}`);
+  reportBtn.disabled = false;
+  await send();
+  running = false;
+  runBtn.disabled = false;
+  render();
+}
+
+async function send(retry = 3) {
+  if (!report) return;
+  for (let attempt = 1; attempt <= retry; attempt++) {
+    try {
+      const res = await fetch('/__report', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(report, null, 2)
+      });
+      if (res.ok) { statusEl.textContent += ' · 已上报'; return; }
+      statusEl.textContent += ` · 上报失败 HTTP ${res.status}`;
+    } catch (err) {
+      statusEl.textContent += ` · 上报异常 ${err.message}`;
+    }
+    await sleep(800);
+  }
+}
+
+runBtn.addEventListener('click', () => runAll());
+reportBtn.addEventListener('click', () => send());
+render();
+setTimeout(() => runAll(), 400);
+</script>
+</body>
+</html>
