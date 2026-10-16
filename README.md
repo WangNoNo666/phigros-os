@@ -4,6 +4,9 @@
 
 纯静态、**零构建、零依赖、零 CDN、可离线运行**：用浏览器打开 `index.html` 就能开机。
 
+**🎮 在线试玩**：<https://wangnono666.github.io/phigros-os/>
+（GitHub Pages 托管，无需安装任何东西）
+
 ```
 phigrOS/
 ├─ index.html            开机自检 → 桌面
@@ -24,11 +27,17 @@ phigrOS/
 │   └─ chartgen.js       确定性谱面生成器（mulberry32 PRNG）
 ├─ js/apps/              phigros / terminal / files / notes / settings / about
 ├─ data/charts/          3 首曲目的曲式与谱面
-├─ tests/                node 纯逻辑自测（判定/谱面/窗口/状态/应用）
-└─ dev/                  静态服务器、语法检查、浏览器验收台
+├─ tests/                node 纯逻辑自测（判定/谱面/窗口/状态/应用/帧循环）
+└─ dev/                  静态服务器、语法检查、浏览器验收台、帧率诊断
 ```
 
 ## 快速开始
+
+### 方式一：直接在线玩
+
+打开 <https://wangnono666.github.io/phigros-os/> 即可。
+
+### 方式二：本地运行
 
 ES Module 需要 http 协议（直接双击 `file://` 打开会被浏览器拦截），所以起一个静态服务：
 
